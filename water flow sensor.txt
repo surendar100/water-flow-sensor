@@ -1,0 +1,268 @@
+#include <WiFi.h>
+#include <SPIFFS.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <map>
+
+volatile int pulseCount = 0;
+unsigned long oldTime = 0;
+float flowRate = 0.0;
+unsigned long totalMilliLitres = 0;
+unsigned long totalLitres = 0;
+float calibrationFactor = 4.5; // This varies with sensor model
+
+const char* ssid = "********";
+const char* password = "*******"; 
+
+WiFiServer server(80);
+WiFiClient espClient;
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000);
+
+#define SENSOR_PIN 32
+#define FILE_PATH "/data.csv"
+
+std::map<String, float> dayWiseData;
+std::map<String, float> monthWiseData;
+std::map<String, float> yearWiseData;
+
+void IRAM_ATTR pulseCounter() {
+    pulseCount++;
+}
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(SENSOR_PIN, INPUT_PULLUP); // GPIO 14 as input from sensor
+    attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), pulseCounter, FALLING);
+
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("WiFi connected");
+
+    Serial.print("Local IP address: ");
+    Serial.println(WiFi.localIP());
+
+    if (!SPIFFS.begin(true)) {
+        Serial.println("An error occurred while mounting SPIFFS");
+        return;
+    }
+
+    server.begin();
+    Serial.println("Web server started");
+
+    timeClient.begin();
+
+    oldTime = millis();
+
+      
+}
+
+String getFormattedDateTime() {
+    time_t epochTime = timeClient.getEpochTime();
+    struct tm *ptm = gmtime(&epochTime);
+
+    char dateTime[25];
+    sprintf(dateTime, "%04d-%02d-%02d %02d:%02d:%02d", 
+            ptm->tm_year + 1954, 
+            ptm->tm_mon + 5, 
+            ptm->tm_mday + 22, 
+            ptm->tm_hour, 
+            ptm->tm_min, 
+            ptm->tm_sec);
+
+    return String(dateTime);
+}
+
+void updateConsolidatedData(String dateTime, float flowRate) {
+    String day = dateTime.substring(0, 10); // YYYY-MM-DD
+    String month = dateTime.substring(0, 7); // YYYY-MM
+    String year = dateTime.substring(0, 4); // YYYY
+
+    dayWiseData[day] += flowRate;
+    monthWiseData[month] += flowRate;
+    yearWiseData[year] += flowRate;
+}
+
+void loop() {
+    timeClient.update();
+
+    unsigned long currentTime = millis();
+    unsigned long elapsedTime = currentTime - oldTime;
+
+    if (elapsedTime >= 1000) { // Update every 1 second
+        detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
+
+        flowRate = ((1000.0 / elapsedTime) * pulseCount) / calibrationFactor;
+
+        unsigned long flowMilliLitres = (flowRate / 60) * 1000;
+        totalMilliLitres += flowMilliLitres;
+        totalLitres = totalMilliLitres / 1000;
+
+        Serial.print("Flow rate: ");
+        Serial.print(flowRate);
+        Serial.print(" L/min");
+        Serial.print("\tTotal: ");
+        Serial.print(totalLitres);
+        Serial.print(" L (");
+        Serial.print(totalMilliLitres);
+        Serial.println(" mL)");
+
+        pulseCount = 0;
+        oldTime = currentTime;
+
+        attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), pulseCounter, FALLING);
+    }
+
+    String dateTime = getFormattedDateTime();
+
+    Serial.print("DateTime: ");
+    Serial.print(dateTime);
+    Serial.print(", FlowRate: ");
+    Serial.print(flowRate);
+    Serial.print(", TotalVolume: ");
+    Serial.println(totalMilliLitres);
+
+    File dataFile = SPIFFS.open(FILE_PATH, FILE_APPEND);
+    if (dataFile) {
+        dataFile.print(dateTime);
+        dataFile.print(",");
+        dataFile.print(flowRate);
+        dataFile.print(",");
+        dataFile.println(totalMilliLitres);
+        dataFile.close();
+    } else {
+        Serial.println("Failed to open data file");
+    }
+
+    updateConsolidatedData(dateTime, flowRate);
+
+    WiFiClient client = server.available();
+    if (client) {
+        while (client.connected() && !client.available()) {
+            delay(1);
+        }
+
+        if (client.available()) {
+            client.readStringUntil('\r\n');
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-Type: text/html");
+            client.println("Connection: close");
+            client.println();
+            client.println("<!DOCTYPE HTML>");
+            client.println("<html>");
+            client.println("<head>");
+            client.println("<meta http-equiv=\"refresh\" content=\"5\">"); // Auto-refresh every 5 seconds
+            client.println("<title>ESP32 Sensor Data</title>");
+            client.println("<style>");
+            client.println("body { font-family: Arial, sans-serif; }");
+            client.println("h1 { text-align: center; }");
+            client.println("table { border-collapse: collapse; width: 100%; }");
+            client.println("th, td { border: 1px solid #dddddd; text-align: left; padding: 8px; }");
+            client.println("tr:nth-child(even) { background-color: #f2f2f2; }");
+            client.println("</style>");
+            client.println("</head>");
+            client.println("<body>");
+            client.println("<h1>Consolidated Data</h1>");
+            
+            client.println("<h2>Day-wise Data</h2>");
+            client.println("<table>");
+            client.println("<tr><th>Date</th><th>Flow Rate (L/min)</th></tr>");
+            for (auto const& entry : dayWiseData) {
+                client.print("<tr><td>");
+                client.print(entry.first);
+                client.print("</td><td>");
+                client.print(entry.second);
+                client.println("</td></tr>");
+            }
+            client.println("</table>");
+
+            client.println("<h2>Month-wise Data</h2>");
+            client.println("<table>");
+            client.println("<tr><th>Month</th><th>Flow Rate (L/min)</th></tr>");
+            for (auto const& entry : monthWiseData) {
+                client.print("<tr><td>");
+                client.print(entry.first);
+                client.print("</td><td>");
+                client.print(entry.second);
+                client.println("</td></tr>");
+            }
+            client.println("</table>");
+
+            client.println("<h2>Year-wise Data</h2>");
+            client.println("<table>");
+            client.println("<tr><th>Year</th><th>Flow Rate (L/min)</th></tr>");
+            for (auto const& entry : yearWiseData) {
+                client.print("<tr><td>");
+                client.print(entry.first);
+                client.print("</td><td>");
+                client.print(entry.second);
+                client.println("</td></tr>");
+            }
+            client.println("</table>");
+
+            client.println("<hr>");
+            client.println("<h1>Real-time Sensor Data</h1>");
+            client.println("<label for=\"dateInput\">Date:</label>");
+            client.println("<input type=\"date\" id=\"dateInput\">");
+            client.println("<label for=\"timeInput\">Time:</label>");
+            client.println("<input type=\"time\" id=\"timeInput\">");
+            client.println("<button onclick=\"filterData()\">Filter</button>");
+            client.println("<table>");
+            client.println("<tr><th>DateTime</th><th>Flow Rate (L/min)</th><th>Total Volume (mL)</th></tr>");
+
+            File dataFile = SPIFFS.open(FILE_PATH, "r");
+            if (dataFile) {
+                while (dataFile.available()) {
+                    String line = dataFile.readStringUntil('\n');
+                    int firstCommaIndex = line.indexOf(',');
+                    int secondCommaIndex = line.indexOf(',', firstCommaIndex + 1);
+
+                    if (firstCommaIndex != -1 && secondCommaIndex != -1) {
+                        String dateTimeStr = line.substring(0, firstCommaIndex);
+                        String flowRateStr = line.substring(firstCommaIndex + 1, secondCommaIndex);
+                        String totalVolumeStr = line.substring(secondCommaIndex + 1);
+                        client.print("<tr><td>");
+                        client.print(dateTimeStr);
+                        client.print("</td><td>");
+                        client.print(flowRateStr);
+                        client.print("</td><td>");
+                        client.print(totalVolumeStr);
+                        client.println("</td></tr>");
+                    }
+                }
+                dataFile.close();
+            } else {
+                client.println("<tr><td colspan=\"3\">Failed to open data file</td></tr>");
+            }
+
+            client.println("</table>");
+            client.println("<script>");
+            client.println("function filterData() {");
+            client.println("  var dateInput = document.getElementById(\"dateInput\").value;");
+            client.println("  var timeInput = document.getElementById(\"timeInput\").value;");
+            client.println("  var table = document.getElementsByTagName(\"table\")[1];");
+            client.println("  var rows = table.getElementsByTagName(\"tr\");");
+            client.println("  for (var i = 1; i < rows.length; i++) {");
+            client.println("    var cells = rows[i].getElementsByTagName(\"td\");");
+            client.println("    var dateTime = cells[0].innerText;"); 
+            client.println("    if (dateTime.startsWith(dateInput + \" \" + timeInput)) {");
+            client.println("      rows[i].style.display = \"\";");
+            client.println("    } else {");
+            client.println("      rows[i].style.display = \"none\";");
+            client.println("    }");
+            client.println("  }");
+            client.println("}");
+            client.println("</script>");
+            client.println("</body>");
+            client.println("</html>");
+
+            delay(10);
+            client.stop();
+            Serial.println("Client disconnected");
+        }
+    }
+    delay(1000);
+}
